@@ -515,6 +515,42 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 draft_num_layers=int(draft_num_layers),
             )
 
+        if server_args.enable_spec_capture and not self.is_draft_worker:
+            # Aux capture without a draft worker, routed to the strategy's own
+            # capture method (they wire different submodules — e.g. VL models
+            # only populate layers_to_capture via the dflash path).
+            capture_method = getattr(server_args, "spec_capture_method", "eagle3")
+            if capture_method in ("dflash", "dspark"):
+                # DSpark rides the DFlash aux plumbing: this patch's supported
+                # targets expose dflash capture hooks (targets with a native
+                # dspark hook are served by the kimi-k3 patch variant).
+                self.dflash_use_aux_hidden_state = True
+                self.dflash_target_layer_ids = server_args.spec_capture_aux_layer_ids
+                if hasattr(self, "spec_aux_config"):
+                    self.spec_aux_config.dflash_use_aux_hidden_state = True
+                    self.spec_aux_config.dflash_target_layer_ids = (
+                        server_args.spec_capture_aux_layer_ids
+                    )
+                self.dflash_family_use_aux_hidden_state = True
+                self.dflash_family_target_layer_ids = (
+                    server_args.spec_capture_aux_layer_ids
+                )
+            elif capture_method == "eagle3":
+                self.eagle_use_aux_hidden_state = True
+                self.eagle_aux_hidden_state_layer_ids = (
+                    server_args.spec_capture_aux_layer_ids
+                )
+                if hasattr(self, "spec_aux_config"):
+                    self.spec_aux_config.eagle_use_aux_hidden_state = True
+                    self.spec_aux_config.eagle_aux_hidden_state_layer_ids = (
+                        server_args.spec_capture_aux_layer_ids
+                    )
+            else:
+                raise ValueError(
+                    "--spec-capture-method must be one of: eagle3, dflash, dspark; "
+                    f"got {capture_method!r}"
+                )
+
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:
             enable_show_time_cost()

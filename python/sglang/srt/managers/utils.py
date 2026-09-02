@@ -77,6 +77,16 @@ class GenerationBatchResult:
         Only the tensors which are needed for processing results are copied,
         e.g., next_token_ids, logits outputs
         """
+        if (
+            return_hidden_states
+            and self.logits_output.last_hidden_states is not None
+        ):
+            # Spec-capture's post-norm last hidden rides the same async D2H
+            # as the aux hidden states (the field exists only when the
+            # spec-capture patch is applied).
+            self.logits_output.last_hidden_states = (
+                self.logits_output.last_hidden_states.to("cpu", non_blocking=True)
+            )
         if return_logprob:
             if self.logits_output.next_token_logprobs is not None:
                 self.logits_output.next_token_logprobs = (

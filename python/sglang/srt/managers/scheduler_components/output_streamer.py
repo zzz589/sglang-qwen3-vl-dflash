@@ -145,6 +145,14 @@ class SchedulerOutputStreamer:
         for req in reqs:
             if req is skip_req:
                 continue
+            if self.server_args.enable_spec_capture and req.spec_capture is not None:
+                # Capture requests are not complete until the background sink
+                # has durably published every feature object.  Several
+                # scheduler paths can ask the common streamer to emit a
+                # finished request; centralize the completion barrier here so
+                # none of them can win the race and send a metadata-less 200.
+                if req.finished() and req.spec_capture_result is None:
+                    continue
             if req.finished() and req.finished_output:
                 # With the overlap schedule, a request will try to output twice and hit this line twice
                 # because of the one additional delayed token. This "continue" prevented the dummy output.
@@ -273,6 +281,7 @@ class _GenerationStreamAccumulator:
     spec_correct_drafts_histogram: list = field(default_factory=list)
     retraction_counts: list = field(default_factory=list)
     output_hidden_states: Optional[list] = None
+    spec_capture: list = field(default_factory=list)
     routed_experts: Optional[list] = None
     indexer_topk: Optional[list] = None
     customized_info: dict = field(default_factory=dict)
@@ -482,6 +491,8 @@ class _GenerationStreamAccumulator:
                 self.output_hidden_states.append(hs)
             else:
                 self.output_hidden_states.append(None)
+        # Per-request spec-capture result (aligned with rids), like the field above.
+        self.spec_capture.append(getattr(req, "spec_capture_result", None))
         if self.return_routed_experts:
             self.routed_experts.append(
                 req.routed_experts if req.return_routed_experts else None
@@ -540,6 +551,7 @@ class _GenerationStreamAccumulator:
             output_token_ids_logprobs_idx=self.output_token_ids_logprobs_idx,
             output_token_entropy_val=None,
             output_hidden_states=self.output_hidden_states,
+            spec_capture=self.spec_capture or None,
             routed_experts=self.routed_experts,
             indexer_topk=self.indexer_topk,
             customized_info=self.customized_info,

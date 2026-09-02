@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+import os
+import time
+from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Callable,
@@ -78,6 +80,12 @@ class SchedulerBatchResultProcessor:
     logprob_result_processor: SchedulerLogprobResultProcessor
     output_streamer: SchedulerOutputStreamer
     abort_request: Callable
+    _spec_capture_batches: List = field(
+        default_factory=list,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -181,6 +189,7 @@ class SchedulerBatchResultProcessor:
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         skip_stream_req = None
+        pending_spec_captures: List = []
 
         if self.is_generation:
             if result.copy_done is not None:
@@ -257,6 +266,20 @@ class SchedulerBatchResultProcessor:
                         )
 
                     if (
+                        req.spec_capture is not None
+                        and logits_output.hidden_states is not None
+                    ):
+                        # Spec-training capture: keep tensor slices, sink on finish.
+                        hidden_state_offset = self._append_spec_capture_states(
+                            req=req,
+                            logits_output=logits_output,
+                            hidden_state_offset=hidden_state_offset,
+                        )
+                        if req.finished():
+                            pending = self._sink_spec_capture(req)
+                            if pending is not None:
+                                pending_spec_captures.append(pending)
+                    elif (
                         req.return_hidden_states
                         and logits_output.hidden_states is not None
                     ):
@@ -329,9 +352,25 @@ class SchedulerBatchResultProcessor:
                     req.inflight_middle_chunks -= 1
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
-        self.output_streamer.stream_output(
-            batch.reqs, batch.return_logprob, skip_stream_req
-        )
+        if pending_spec_captures:
+            self._queue_spec_captures(
+                pending_spec_captures,
+                return_logprob=batch.return_logprob,
+            )
+            capture_req_ids = {id(item[0]) for item in pending_spec_captures}
+            ready_reqs = [
+                req
+                for req in batch.reqs
+                if id(req) not in capture_req_ids and req is not skip_stream_req
+            ]
+            if ready_reqs:
+                self.output_streamer.stream_output(
+                    ready_reqs, batch.return_logprob
+                )
+        else:
+            self.output_streamer.stream_output(
+                batch.reqs, batch.return_logprob, skip_stream_req
+            )
 
         can_run_cuda_graph = result.can_run_cuda_graph
         self.metrics_reporter.report_prefill_stats(
@@ -461,6 +500,183 @@ class SchedulerBatchResultProcessor:
                     f"{batch.contains_last_prefill_chunk}). "
                     f"Placeholder zeros would be appended to output_ids."
                 )
+
+    def _append_spec_capture_states(
+        self,
+        *,
+        req: Req,
+        logits_output: LogitsProcessorOutput,
+        hidden_state_offset: int,
+    ) -> int:
+        """Accumulate captured rows as CPU tensors for the Mooncake sink.
+
+        Same offset arithmetic as ``_append_prefill_hidden_states`` but keeps
+        tensor slices (aux concat in ``hidden_states``, post-norm last in
+        ``last_hidden_states``) rather than the JSON-able response payload.
+        """
+        start = hidden_state_offset
+        end = start + len(req.origin_input_ids)
+        # Only attention-TP rank 0 owns the Mooncake sink.  Copying these very
+        # large tensors to host on every TP rank creates identical D2H
+        # transfers whose results are immediately discarded on TP > 1.
+        if self.output_streamer.ps.attn_tp_rank != 0:
+            return end
+        # Materialize each scheduler result on host once, rather than issuing
+        # one synchronous D2H transfer per request.  In overlap mode the writer
+        # rank has already copied both tensors asynchronously on copy_stream;
+        # ``.cpu()`` is then a no-op.  The fallback keeps non-overlap correct.
+        features = dict(req.spec_capture.get("features") or {})
+        aux_cpu = getattr(logits_output, "_spec_capture_aux_cpu", None)
+        if "aux" in features and aux_cpu is None:
+            aux_cpu = logits_output.hidden_states.cpu()
+            logits_output._spec_capture_aux_cpu = aux_cpu
+        last_hidden_cpu = getattr(
+            logits_output, "_spec_capture_last_hidden_cpu", None
+        )
+        if (
+            "last_hidden" in features
+            and logits_output.last_hidden_states is not None
+            and last_hidden_cpu is None
+        ):
+            last_hidden_cpu = logits_output.last_hidden_states.cpu()
+            logits_output._spec_capture_last_hidden_cpu = last_hidden_cpu
+        if "aux" in features and aux_cpu is not None:
+            req.spec_capture_aux.append(aux_cpu[start:end])
+        if "last_hidden" in features and last_hidden_cpu is not None:
+            req.spec_capture_last_hidden.append(last_hidden_cpu[start:end])
+        return end
+
+    def _sink_spec_capture(self, req: Req):
+        """Stage a finished capture request for the background Mooncake sink.
+
+        Runs on the attention-TP rank that streams output; returns the pending
+        tuple queued by ``_queue_spec_captures`` (or ``None`` off the writer
+        rank).  The per-request result (or an ``{"error": ...}`` marker) is set
+        on ``req.spec_capture_result`` when the batch transfer completes, and
+        returned to the client via the dedicated ``spec_capture`` output field
+        (a per-request channel, unlike per-token ``customized_info``).
+        """
+        from sglang.srt import spec_capture_sink
+
+        sink = spec_capture_sink.get_sink()
+        if sink is None or self.output_streamer.ps.attn_tp_rank != 0:
+            return None
+        timing_enabled = os.environ.get("SGLANG_SPEC_CAPTURE_TIMING", "0") == "1"
+        cat_start = time.perf_counter()
+        # With chunked prefill disabled (the recommended capture-server
+        # configuration), each request owns exactly one contiguous view into
+        # the batch-level D2H buffer.  torch.cat([view]) needlessly copied the
+        # whole capture a second time on CPU.  Keep that view zero-copy;
+        # concatenate only the genuinely chunked case.
+        aux = self._coalesce_spec_capture_chunks(req.spec_capture_aux)
+        last_hidden = self._coalesce_spec_capture_chunks(
+            req.spec_capture_last_hidden
+        )
+        cat_ms = (time.perf_counter() - cat_start) * 1000.0
+        req.spec_capture_aux = []
+        req.spec_capture_last_hidden = []
+        return req, req.spec_capture, aux, last_hidden, timing_enabled, cat_ms
+
+    def _queue_spec_captures(self, pending, *, return_logprob: bool) -> None:
+        """Queue one batch transfer while the scheduler runs the next prefill."""
+        if not pending:
+            return
+        from sglang.srt import spec_capture_sink
+
+        sink = spec_capture_sink.get_sink()
+        samples = [
+            (spec, aux, last_hidden)
+            for _, spec, aux, last_hidden, _, _ in pending
+        ]
+        self._spec_capture_batches.append(
+            (
+                pending,
+                sink.submit_samples(samples),
+                return_logprob,
+                time.perf_counter(),
+            )
+        )
+        # Bound retained D2H buffers.  Reaching this point means the target
+        # prefill for batch N+1 already overlapped host transfer N; wait only
+        # if N is still finishing before admitting N+2.
+        max_pending = int(
+            os.environ.get("SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES", "2")
+        )
+        if max_pending < 1:
+            raise ValueError("SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES must be >= 1")
+        if len(self._spec_capture_batches) >= max_pending:
+            self.drain_spec_captures(block=True, max_batches=1)
+
+    def has_pending_spec_captures(self) -> bool:
+        return bool(self._spec_capture_batches)
+
+    def drain_spec_captures(
+        self, *, block: bool = False, max_batches: Optional[int] = None
+    ) -> int:
+        """Finish ready transfers and stream their responses on this thread."""
+        completed = 0
+        while self._spec_capture_batches:
+            if max_batches is not None and completed >= max_batches:
+                break
+            pending, future, return_logprob, queued_at = self._spec_capture_batches[0]
+            if not block and not future.done():
+                break
+            self._spec_capture_batches.pop(0)
+            self._complete_spec_capture_batch(
+                pending,
+                future,
+                return_logprob=return_logprob,
+                queued_at=queued_at,
+            )
+            completed += 1
+        return completed
+
+    def _complete_spec_capture_batch(
+        self, pending, future, *, return_logprob: bool, queued_at: float
+    ) -> None:
+        try:
+            results = future.result()
+            if len(results) != len(pending):
+                raise RuntimeError(
+                    f"spec-capture sink returned {len(results)} results for "
+                    f"{len(pending)} samples"
+                )
+        except Exception as e:
+            logger.error(
+                "spec-capture batch sink failed for %d requests: %s", len(pending), e
+            )
+            for req, spec, _, _, _, _ in pending:
+                req.spec_capture_result = {
+                    "sample_id": spec.get("sample_id"),
+                    "error": str(e),
+                }
+        else:
+            for pending_item, result in zip(pending, results):
+                req, _, _, _, _, _ = pending_item
+                req.spec_capture_result = result
+
+        timing_enabled = any(item[4] for item in pending)
+        if timing_enabled:
+            logger.info(
+                "[spec-capture-timing] async_batch_complete samples=%d "
+                "queue_to_stream_ms=%.3f cat_ms=%.3f",
+                len(pending),
+                (time.perf_counter() - queued_at) * 1000.0,
+                sum(item[5] for item in pending),
+            )
+        self.output_streamer.stream_output(
+            [item[0] for item in pending], return_logprob
+        )
+
+    @staticmethod
+    def _coalesce_spec_capture_chunks(
+        chunks: List[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if not chunks:
+            return None
+        if len(chunks) == 1:
+            return chunks[0]
+        return torch.cat(chunks, dim=0)
 
     def _append_prefill_hidden_states(
         self,
