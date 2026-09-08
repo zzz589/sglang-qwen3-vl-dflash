@@ -1,9 +1,11 @@
 import logging
 import math
 from copy import deepcopy
+from pathlib import Path
 from typing import List, Optional
 
 import torch
+from safetensors import safe_open
 
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -100,6 +102,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         self._warned_sampling_fallback = False
         self._logged_first_verify = False
+        self._logged_first_draft_mrope = False
 
         # Draft runner (separate KV cache + attention backend).
         draft_server_args = deepcopy(server_args)
@@ -163,9 +166,141 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Keep the same alias that other spec-v2 workers expose.
         self._draft_worker.draft_runner = self.draft_model_runner
         self.draft_model = self.draft_model_runner.model
-        draft_config = parse_dflash_draft_config(
-            draft_hf_config=self.draft_model_runner.model_config.hf_config
+
+        # A compressed-vocabulary DFlash checkpoint predicts only its hot
+        # vocabulary. The checkpoint stores:
+        #
+        #   t2d: boolean mask over the target vocabulary
+        #   d2t: non-negative offsets from local draft ids to target ids
+        #
+        # Therefore the absolute target ids are:
+        #
+        #   arange(draft_vocab_size) + d2t
+        #
+        # Keep full-vocabulary checkpoints on the existing fast path.
+        draft_hf_config = self.draft_model_runner.model_config.hf_config
+        target_vocab_size = int(
+            getattr(draft_hf_config, "vocab_size")
         )
+        draft_vocab_size = int(
+            getattr(
+                draft_hf_config,
+                "draft_vocab_size",
+                target_vocab_size,
+            )
+        )
+
+        self._draft_hot_token_ids: Optional[torch.Tensor] = None
+        self._draft_hot_lm_head_weight: Optional[torch.Tensor] = None
+
+        if draft_vocab_size < target_vocab_size:
+            checkpoint_path = Path(
+                server_args.speculative_draft_model_path
+            )
+            weights_path = checkpoint_path / "model.safetensors"
+
+            if not weights_path.is_file():
+                raise FileNotFoundError(
+                    "Compressed DFLASH checkpoint requires "
+                    f"{weights_path}"
+                )
+
+            with safe_open(
+                str(weights_path),
+                framework="pt",
+                device="cpu",
+            ) as weights:
+                available = set(weights.keys())
+
+                if "d2t" not in available or "t2d" not in available:
+                    raise ValueError(
+                        "Compressed DFLASH checkpoint is missing "
+                        "d2t/t2d vocabulary mapping tensors"
+                    )
+
+                d2t = weights.get_tensor("d2t").to(
+                    dtype=torch.int64
+                )
+                t2d = weights.get_tensor("t2d").to(
+                    dtype=torch.bool
+                )
+
+            if tuple(d2t.shape) != (draft_vocab_size,):
+                raise ValueError(
+                    "DFLASH d2t shape mismatch: "
+                    f"expected={(draft_vocab_size,)}, "
+                    f"actual={tuple(d2t.shape)}"
+                )
+
+            if tuple(t2d.shape) != (target_vocab_size,):
+                raise ValueError(
+                    "DFLASH t2d shape mismatch: "
+                    f"expected={(target_vocab_size,)}, "
+                    f"actual={tuple(t2d.shape)}"
+                )
+
+            hot_token_ids = (
+                torch.arange(
+                    draft_vocab_size,
+                    dtype=torch.int64,
+                )
+                + d2t
+            )
+
+            if hot_token_ids.numel() != draft_vocab_size:
+                raise ValueError(
+                    "DFLASH hot vocabulary size mismatch"
+                )
+
+            if (
+                int(hot_token_ids[0]) < 0
+                or int(hot_token_ids[-1]) >= target_vocab_size
+            ):
+                raise ValueError(
+                    "DFLASH d2t maps outside target vocabulary"
+                )
+
+            if hot_token_ids.numel() > 1 and not torch.all(
+                hot_token_ids[1:] > hot_token_ids[:-1]
+            ):
+                raise ValueError(
+                    "DFLASH hot target token ids must be "
+                    "strictly increasing"
+                )
+
+            if not torch.equal(
+                torch.nonzero(
+                    t2d,
+                    as_tuple=False,
+                ).flatten(),
+                hot_token_ids,
+            ):
+                raise ValueError(
+                    "DFLASH d2t and t2d mappings disagree"
+                )
+
+            self._draft_hot_token_ids = hot_token_ids.to(
+                device=self.device
+            )
+
+            if self.tp_rank == 0:
+                logger.info(
+                    "DFLASH compressed vocabulary enabled: "
+                    "draft_vocab_size=%s, target_vocab_size=%s, "
+                    "hot_id_min=%s, hot_id_max=%s",
+                    draft_vocab_size,
+                    target_vocab_size,
+                    int(hot_token_ids[0]),
+                    int(hot_token_ids[-1]),
+                )
+
+        draft_config = parse_dflash_draft_config(
+            draft_hf_config=draft_hf_config
+        )
+        draft_rope_scaling = getattr(
+            self.draft_model_runner.model_config.hf_config, "rope_scaling", None
+        ) or {}
+        self._draft_uses_mrope = "mrope_section" in draft_rope_scaling
         if server_args.speculative_num_draft_tokens is None:
             # Should not happen (ServerArgs should have inferred it), but keep a fallback.
             self.block_size = int(draft_config.resolve_block_size(default=16))
@@ -257,6 +392,110 @@ class DFlashWorkerV2(BaseSpecWorker):
     @property
     def target_worker(self) -> TpModelWorker:
         return self._target_worker
+
+    def _build_draft_rope_positions(
+        self,
+        *,
+        batch: ScheduleBatch,
+        logical_positions: torch.Tensor,
+        token_counts: List[int],
+    ) -> torch.Tensor:
+        """Return the RoPE positions matching the target's Qwen-VL mRoPE.
+
+        ``logical_positions`` remains the 1-D sequence position used for cache
+        addressing.  For tokens covered by the multimodal prefill metadata we
+        gather the exact three-axis positions produced by the processor.  Text
+        continuation positions use Qwen-VL's shared mRoPE delta on all axes.
+        """
+        if not self._draft_uses_mrope:
+            return logical_positions
+        if logical_positions.ndim != 1:
+            raise ValueError(
+                "DFLASH logical_positions must be 1D, "
+                f"got shape={tuple(logical_positions.shape)}."
+            )
+        if sum(int(count) for count in token_counts) != int(
+            logical_positions.numel()
+        ):
+            raise ValueError(
+                "DFLASH mRoPE token-count mismatch: "
+                f"counts={token_counts}, positions={int(logical_positions.numel())}."
+            )
+
+        mm_inputs = batch.multimodal_inputs
+        if mm_inputs is None:
+            mm_inputs = [None] * len(token_counts)
+        if len(mm_inputs) != len(token_counts):
+            raise ValueError(
+                "DFLASH multimodal batch-size mismatch: "
+                f"multimodal_inputs={len(mm_inputs)}, token_counts={len(token_counts)}."
+            )
+
+        chunks = []
+        offset = 0
+        for request_index, count in enumerate(token_counts):
+            count = int(count)
+            request_positions = logical_positions[offset : offset + count]
+            offset += count
+            request_mrope = request_positions.unsqueeze(0).repeat(3, 1)
+
+            mm_input = mm_inputs[request_index]
+            if mm_input is not None:
+                stored = getattr(mm_input, "mrope_positions", None)
+                delta = getattr(mm_input, "mrope_position_delta", 0)
+                if torch.is_tensor(delta):
+                    delta = int(delta.reshape(-1)[0].item())
+                else:
+                    delta = int(delta or 0)
+
+                if stored is not None:
+                    stored = torch.as_tensor(
+                        stored,
+                        dtype=torch.int64,
+                        device=logical_positions.device,
+                    )
+                    if stored.ndim == 3 and int(stored.shape[0]) == 1:
+                        stored = stored.squeeze(0)
+                    if stored.ndim != 2 or int(stored.shape[0]) != 3:
+                        raise ValueError(
+                            "DFLASH expected per-request mRoPE positions [3, seq], "
+                            f"got request={request_index}, shape={tuple(stored.shape)}."
+                        )
+                    in_prompt = (request_positions >= 0) & (
+                        request_positions < int(stored.shape[1])
+                    )
+                    if bool(in_prompt.any()):
+                        request_mrope[:, in_prompt] = stored.index_select(
+                            1, request_positions[in_prompt]
+                        )
+                    continuation = ~in_prompt
+                else:
+                    continuation = torch.ones_like(
+                        request_positions, dtype=torch.bool
+                    )
+
+                if bool(continuation.any()):
+                    continuation_positions = (
+                        request_positions[continuation] + delta
+                    )
+                    request_mrope[:, continuation] = continuation_positions.unsqueeze(
+                        0
+                    ).repeat(3, 1)
+
+            chunks.append(request_mrope)
+
+        result = torch.cat(chunks, dim=1)
+        if not self._logged_first_draft_mrope and self.tp_rank == 0:
+            logger.info(
+                "DFLASH draft mRoPE active: logical_shape=%s, rope_shape=%s, "
+                "rope_min=%s, rope_max=%s",
+                tuple(logical_positions.shape),
+                tuple(result.shape),
+                int(result.min().item()) if result.numel() else None,
+                int(result.max().item()) if result.numel() else None,
+            )
+            self._logged_first_draft_mrope = True
+        return result
 
     @property
     def draft_worker(self):
@@ -635,6 +874,73 @@ class DFlashWorkerV2(BaseSpecWorker):
         def _cast_hs(x: torch.Tensor) -> torch.Tensor:
             return x if x.dtype == weight_dtype else x.to(weight_dtype)
 
+        hot_token_ids = self._draft_hot_token_ids
+
+        if hot_token_ids is not None:
+            tp_size = int(get_tp_group().world_size)
+
+            if tp_size != 1:
+                raise NotImplementedError(
+                    "Compressed-vocabulary DFLASH currently "
+                    "supports TP=1 only"
+                )
+
+            if (
+                self._draft_hot_lm_head_weight is None
+                or self._draft_hot_lm_head_weight.device
+                != weight.device
+                or self._draft_hot_lm_head_weight.dtype
+                != weight.dtype
+            ):
+                self._draft_hot_lm_head_weight = (
+                    weight.index_select(
+                        0,
+                        hot_token_ids.to(device=weight.device),
+                    ).contiguous()
+                )
+
+                if self.tp_rank == 0:
+                    logger.info(
+                        "DFLASH compressed LM head materialized: "
+                        "shape=%s, dtype=%s, device=%s",
+                        tuple(
+                            self._draft_hot_lm_head_weight.shape
+                        ),
+                        self._draft_hot_lm_head_weight.dtype,
+                        self._draft_hot_lm_head_weight.device,
+                    )
+
+            hot_weight = self._draft_hot_lm_head_weight
+            fast_chunk_size = max(int(chunk_size), 1024)
+
+            for start in range(
+                0,
+                num_tokens,
+                fast_chunk_size,
+            ):
+                end = min(
+                    num_tokens,
+                    start + fast_chunk_size,
+                )
+                hs = _cast_hs(hidden_states[start:end])
+                logits = torch.matmul(
+                    hs,
+                    hot_weight.T,
+                )
+                draft_local_ids = torch.argmax(
+                    logits,
+                    dim=-1,
+                )
+
+                out_tokens[start:end].copy_(
+                    hot_token_ids.index_select(
+                        0,
+                        draft_local_ids.to(torch.int64),
+                    )
+                )
+
+            return out_tokens
+
         if not hasattr(lm_head, "shard_indices"):
             for start in range(0, num_tokens, int(chunk_size)):
                 end = min(num_tokens, start + int(chunk_size))
@@ -826,6 +1132,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         target_hidden: torch.Tensor,
         cache_loc: torch.Tensor,
         positions: torch.Tensor,
+        rope_positions: Optional[torch.Tensor] = None,
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
     ) -> None:
@@ -864,6 +1171,23 @@ class DFlashWorkerV2(BaseSpecWorker):
                 "DFLASH positions length mismatch: "
                 f"positions={int(positions.numel())}, target_hidden={num_tokens}."
             )
+        if rope_positions is None:
+            rope_positions = positions
+        if rope_positions.ndim not in (1, 2):
+            raise ValueError(
+                "DFLASH rope_positions must be 1D or 2D, "
+                f"got shape={tuple(rope_positions.shape)}."
+            )
+        if rope_positions.ndim == 2 and int(rope_positions.shape[0]) != 3:
+            raise ValueError(
+                "DFLASH mRoPE positions must have shape [3, num_tokens], "
+                f"got shape={tuple(rope_positions.shape)}."
+            )
+        if int(rope_positions.shape[-1]) != num_tokens:
+            raise ValueError(
+                "DFLASH rope_positions length mismatch: "
+                f"rope_positions={tuple(rope_positions.shape)}, target_hidden={num_tokens}."
+            )
         if cache_loc_2d is not None:
             if cache_loc_2d.ndim != 2:
                 raise ValueError(
@@ -885,6 +1209,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             cache_loc = cache_loc.to(device, non_blocking=True)
         if positions.device != device:
             positions = positions.to(device, non_blocking=True)
+        if rope_positions.device != device:
+            rope_positions = rope_positions.to(device, non_blocking=True)
         if target_hidden.device != device:
             target_hidden = target_hidden.to(device, non_blocking=True)
 
@@ -892,6 +1218,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             cache_loc = cache_loc.to(torch.int64)
         if positions.dtype != torch.int64:
             positions = positions.to(torch.int64)
+        if rope_positions.dtype != torch.int64:
+            rope_positions = rope_positions.to(torch.int64)
         if cache_loc_2d is not None:
             if cache_loc_2d.device != device:
                 cache_loc_2d = cache_loc_2d.to(device, non_blocking=True)
@@ -915,11 +1243,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                     )
                 if bs == 0:
                     return
-                if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
+                if (
+                    rope_positions.ndim == 1
+                    and self._use_fused_kv_materialize
+                    and self._fused_kv_helper is not None
+                ):
                     try:
                         self._append_target_hidden_fused(
                             ctx_hidden=ctx_hidden,
-                            ctx_positions=positions,
+                            ctx_positions=rope_positions,
                             ctx_cache_loc=cache_loc,
                             ctx_cache_loc_2d=cache_loc_2d,
                             commit_lens=commit_lens,
@@ -937,7 +1269,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     attn = layer.self_attn
                     k, v = attn.kv_proj_only(ctx_hidden)
                     k = attn.apply_k_norm(k)
-                    k = attn.apply_k_rope(positions, k)
+                    k = attn.apply_k_rope(rope_positions, k)
                     k = k.view(-1, attn.num_kv_heads, attn.head_dim)
                     v = v.view(-1, attn.num_kv_heads, attn.head_dim)
 
@@ -952,11 +1284,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                     )
                 return
 
-            if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
+            if (
+                rope_positions.ndim == 1
+                and self._use_fused_kv_materialize
+                and self._fused_kv_helper is not None
+            ):
                 try:
                     self._append_target_hidden_fused(
                         ctx_hidden=ctx_hidden,
-                        ctx_positions=positions,
+                        ctx_positions=rope_positions,
                         ctx_cache_loc=cache_loc,
                     )
                     return
@@ -970,7 +1306,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
             self._append_target_hidden_sequential(
                 ctx_hidden=ctx_hidden,
-                ctx_positions=positions,
+                ctx_positions=rope_positions,
                 ctx_cache_loc=cache_loc,
             )
 
@@ -1261,10 +1597,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_lens,
                 int(sum(model_worker_batch.extend_lens)),
             )
+            rope_positions = self._build_draft_rope_positions(
+                batch=model_worker_batch,
+                logical_positions=positions,
+                token_counts=model_worker_batch.extend_lens,
+            )
             self._append_target_hidden_to_draft_kv_by_loc(
                 target_hidden=logits_output.hidden_states,
                 cache_loc=model_worker_batch.out_cache_loc,
                 positions=positions,
+                rope_positions=rope_positions,
             )
 
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
@@ -1405,6 +1747,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
         positions = positions_2d.reshape(-1)
+        draft_rope_positions = self._build_draft_rope_positions(
+            batch=model_worker_batch,
+            logical_positions=positions,
+            token_counts=[block_size] * bs,
+        )
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
 
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
@@ -1480,6 +1827,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
+        if draft_rope_positions.ndim == 2:
+            forward_batch.mrope_positions = draft_rope_positions
 
         with torch.inference_mode():
             draft_logits_output = self.draft_model_runner.forward(
@@ -1664,6 +2013,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             cache_loc=verify_out_cache_loc,
             cache_loc_2d=verify_out_cache_loc_2d,
             positions=positions,
+            rope_positions=(
+                verify_forward_batch.mrope_positions
+                if getattr(verify_forward_batch, "mrope_positions", None) is not None
+                else draft_rope_positions
+            ),
             commit_lens=commit_lens,
         )
 

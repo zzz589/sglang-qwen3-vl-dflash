@@ -383,9 +383,18 @@ class DFlashDraftModel(nn.Module):
         hidden_states = input_embeds
         residual: Optional[torch.Tensor] = None
 
+        # Qwen-VL target models use multimodal RoPE (mRoPE).  ForwardBatch keeps
+        # the logical 1-D positions for cache addressing and exposes the actual
+        # rotary positions separately as [3, num_tokens].  The draft must use
+        # the latter whenever it is available; otherwise MRotaryEmbedding falls
+        # back to ordinary 1-D RoPE and no longer matches SpecForge training.
+        rotary_positions = getattr(forward_batch, "mrope_positions", None)
+        if rotary_positions is None:
+            rotary_positions = positions
+
         for layer in self.layers:
             hidden_states, residual = layer(
-                positions, hidden_states, forward_batch, residual
+                rotary_positions, hidden_states, forward_batch, residual
             )
 
         if hidden_states.numel() != 0:
