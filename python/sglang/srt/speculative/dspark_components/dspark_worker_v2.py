@@ -57,6 +57,9 @@ from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
+from sglang.srt.speculative.dspark_components.dspark_mrope import (
+    build_dspark_rope_positions,
+)
 from sglang.srt.speculative.dspark_components.dspark_observability import (
     DsparkStepObservers,
     InfoSegment,
@@ -697,6 +700,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             ctx_lens,
             int(sum(batch.extend_lens)),
         )
+        rope_positions = build_dspark_rope_positions(
+            batch=batch,
+            logical_positions=positions,
+            token_counts=batch.extend_lens,
+            use_mrope=bool(self.draft_model_runner.model_config.model_is_mrope),
+        )
         # unified_kv injects into the SWA ring keyed by (draft req slot, position);
         # thread the per-token state_slot + the req's final position so the
         # injector keeps only the last SWA window (older prefill tokens share a
@@ -722,6 +731,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         if token_indices is not None:
             cache_loc = cache_loc[token_indices]
             positions = positions[token_indices]
+            rope_positions = rope_positions[:, token_indices] if rope_positions.ndim == 2 else rope_positions[token_indices]
             if state_slot is not None:
                 state_slot = state_slot[token_indices]
                 final_pos = final_pos[token_indices]
@@ -729,6 +739,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             target_hidden=logits_output.hidden_states,
             cache_loc=cache_loc,
             positions=positions,
+            rope_positions=rope_positions,
             state_slot=state_slot,
             final_pos=final_pos,
             target_hidden_is_projected=target_hidden_is_projected,

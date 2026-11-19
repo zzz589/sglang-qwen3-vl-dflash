@@ -258,10 +258,19 @@ class EagerRunner(BaseRunner):
 
         ctx = device_timer_ctx(model_runner.device_timer, "decode")
 
+        positions = forward_batch.positions
+        if (
+            model_runner.is_draft_worker
+            and model_runner.spec_algorithm.is_dspark()
+            and model_runner.model_config.model_is_mrope
+            and forward_batch.mrope_positions is not None
+        ):
+            positions = forward_batch.mrope_positions
+
         with ctx, pdmux_ctx:
             return model_runner.model.forward(
                 forward_batch.input_ids,
-                forward_batch.positions,
+                positions,
                 forward_batch,
                 **kwargs,
             )

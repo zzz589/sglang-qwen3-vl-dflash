@@ -1,3 +1,5 @@
+import os
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -12,6 +14,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.kv_loc_plan import Cols, KVLocPlan
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.speculative.dspark_components.dspark_mrope import build_dspark_rope_positions
 
 
 class TargetHiddenKvInjector:
@@ -43,6 +46,7 @@ class TargetHiddenKvInjector:
         target_hidden: torch.Tensor,
         cache_loc: torch.Tensor,
         positions: torch.Tensor,
+        rope_positions: Optional[torch.Tensor] = None,
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
         state_slot: Optional[torch.Tensor] = None,
@@ -51,13 +55,41 @@ class TargetHiddenKvInjector:
     ) -> None:
         if target_hidden is None or target_hidden.numel() == 0:
             return
+        parity_dir = os.environ.get("DSPARK_PARITY_DUMP_DIR")
+        if parity_dir:
+            path = Path(parity_dir)
+            path.mkdir(parents=True, exist_ok=True)
+            marker = path / ".inject_counter"
+            try:
+                index = int(marker.read_text())
+            except FileNotFoundError:
+                index = 0
+            marker.write_text(str(index + 1))
+            torch.save(
+                {
+                    "target_hidden": target_hidden.detach().cpu(),
+                    "positions": positions.detach().cpu(),
+                    "rope_positions": None
+                    if rope_positions is None
+                    else rope_positions.detach().cpu(),
+                    "cache_loc": cache_loc.detach().cpu(),
+                },
+                path / f"{index:04d}_target_inject.pt",
+            )
         device = self.model_runner.device
         cache_loc = cache_loc.to(device=device, dtype=torch.int64, non_blocking=True)
         positions = positions.to(device=device, dtype=torch.int64, non_blocking=True)
+        if rope_positions is None:
+            rope_positions = positions
+        else:
+            rope_positions = rope_positions.to(device=device, dtype=torch.int64, non_blocking=True)
+        if rope_positions.ndim not in (1, 2) or rope_positions.shape[-1] != positions.numel():
+            raise ValueError("rope_positions must be [N] or [3, N]")
         target_hidden = target_hidden.to(device=device, non_blocking=True)
         n_real = positions.shape[0]
         if target_hidden.shape[0] > n_real:
             target_hidden = target_hidden[:n_real]
+            rope_positions = rope_positions[..., :n_real]
         if cache_loc_2d is not None:
             cache_loc_2d = cache_loc_2d.to(
                 device=device, dtype=torch.int64, non_blocking=True
@@ -88,6 +120,7 @@ class TargetHiddenKvInjector:
                 target_hidden=target_hidden,
                 cache_loc=cache_loc,
                 positions=positions,
+                rope_positions=rope_positions,
                 cache_loc_2d=cache_loc_2d,
                 commit_lens=commit_lens,
                 state_slot=state_slot,
@@ -100,6 +133,7 @@ class TargetHiddenKvInjector:
                 target_hidden=target_hidden,
                 pool=pool,
                 positions=positions,
+                rope_positions=rope_positions,
                 cache_loc=cache_loc,
                 cache_loc_2d=cache_loc_2d,
                 commit_lens=commit_lens,
@@ -113,6 +147,7 @@ class TargetHiddenKvInjector:
         target_hidden: torch.Tensor,
         cache_loc: torch.Tensor,
         positions: torch.Tensor,
+        rope_positions: torch.Tensor,
         cache_loc_2d: Optional[torch.Tensor],
         commit_lens: Optional[torch.Tensor],
         state_slot: Optional[torch.Tensor] = None,
@@ -162,6 +197,7 @@ class TargetHiddenKvInjector:
                 main_hidden=target_hidden,
                 swa_loc=swa_loc,
                 positions=positions,
+                rope_positions=rope_positions,
                 pool=pool,
             )
 
@@ -249,6 +285,12 @@ class TargetHiddenKvInjector:
             return
 
         positions_2d = prefix_lens.unsqueeze(1) + self._block_pos_offsets
+        rope_positions = build_dspark_rope_positions(
+            batch=batch,
+            logical_positions=positions_2d.reshape(-1),
+            token_counts=[stride] * bs,
+            use_mrope=bool(self.draft_model_runner.model_config.model_is_mrope),
+        )
         verify_cache_loc = self.ids_for(kv_loc_plan)
         verify_cache_loc_2d = verify_cache_loc.view(bs, stride)
         self.inject_target_hidden(
@@ -256,5 +298,6 @@ class TargetHiddenKvInjector:
             cache_loc=verify_cache_loc,
             cache_loc_2d=verify_cache_loc_2d,
             positions=positions_2d.reshape(-1),
+            rope_positions=rope_positions,
             commit_lens=commit_lens,
         )

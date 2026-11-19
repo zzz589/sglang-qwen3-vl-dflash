@@ -37,6 +37,7 @@ from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResu
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
+from sglang.srt.speculative.dspark_components.dspark_mrope import build_dspark_rope_positions
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     VerifyWindow,
     apply_logits_adjustments_strided,
@@ -255,6 +256,12 @@ class TargetVerifyExecutor:
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
+        if self.target_worker.model_runner.model_config.model_is_mrope:
+            verify_forward_batch.compute_spec_mrope_positions(
+                self.target_worker.model_runner,
+                batch,
+                seq_positions=verify_forward_batch.positions,
+            )
         self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
@@ -326,6 +333,12 @@ class TargetVerifyExecutor:
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
+        if self.target_worker.model_runner.model_config.model_is_mrope:
+            verify_forward_batch.compute_spec_mrope_positions(
+                self.target_worker.model_runner,
+                batch,
+                seq_positions=verify_forward_batch.positions,
+            )
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
 
@@ -377,11 +390,19 @@ class TargetVerifyExecutor:
                 batch.req_pool_indices[:bs].view(-1, 1).expand(bs, vlen).reshape(-1)
             )
         cache_loc = self.kv_injector.ids_for(verify_window.kv_loc_plan)
+        logical_positions = verify_window.positions_2d.reshape(-1)
+        rope_positions = build_dspark_rope_positions(
+            batch=batch,
+            logical_positions=logical_positions,
+            token_counts=[verify_window.positions_2d.shape[1]] * bs,
+            use_mrope=bool(self.kv_injector.draft_model_runner.model_config.model_is_mrope),
+        )
         self.kv_injector.inject_target_hidden(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
             cache_loc=cache_loc,
             cache_loc_2d=cache_loc.view(verify_window.verify_cache_loc_2d.shape),
-            positions=verify_window.positions_2d.reshape(-1),
+            positions=logical_positions,
+            rope_positions=rope_positions,
             commit_lens=commit_lens,
             state_slot=state_slot,
         )
@@ -452,7 +473,21 @@ class TargetVerifyExecutor:
             model_runner=self.model_runner,
         )
         if self.verify_epilogue is not None:
-            self.verify_epilogue.begin_step(layout.verify_lens, armed=inject_gate)
+            rope_positions = None
+            if self.target_worker.model_runner.model_config.model_is_mrope:
+                logical_positions = (
+                    batch.seq_lens[:bs].to(torch.int64).view(-1, 1)
+                    + self.kv_injector._block_pos_offsets[:stride].view(1, -1)
+                ).reshape(-1)
+                rope_positions = build_dspark_rope_positions(
+                    batch=batch,
+                    logical_positions=logical_positions,
+                    token_counts=[stride] * bs,
+                    use_mrope=True,
+                )
+            self.verify_epilogue.begin_step(
+                layout.verify_lens, armed=inject_gate, rope_positions=rope_positions
+            )
         target_verify = self._run_ragged(
             batch=batch,
             layout=layout,
@@ -572,6 +607,7 @@ class DsparkVerifyEpilogue:
         self.strided_logits: Optional[torch.Tensor] = None
         self.strided_hidden: Optional[torch.Tensor] = None
         self._static_step_state: Optional[tuple[int, bool]] = None
+        self.rope_positions: Optional[torch.Tensor] = None
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
         if (
@@ -597,8 +633,9 @@ class DsparkVerifyEpilogue:
             bs=forward_batch.batch_size,
         )
 
-    def begin_step(self, verify_lens, armed: bool) -> None:
+    def begin_step(self, verify_lens, armed: bool, rope_positions=None) -> None:
         self._static_step_state = None
+        self.rope_positions = rope_positions
         if verify_lens is None:
             self.verify_lens_buf.zero_()
         else:
@@ -647,6 +684,7 @@ class DsparkVerifyEpilogue:
             cache_loc=cache_loc,
             cache_loc_2d=cache_loc.view(bs, self.stride),
             positions=forward_batch.positions,
+            rope_positions=getattr(forward_batch, "mrope_positions", None),
             commit_lens=gated_commit_lens,
             state_slot=state_slot,
         )
@@ -799,6 +837,7 @@ class DsparkVerifyEpilogue:
                 main_hidden=self.strided_hidden[: bs * self.stride],
                 swa_loc=inject_layout.swa_loc,
                 positions=inject_layout.positions,
+                rope_positions=self.rope_positions,
                 pool=pool,
             )
 

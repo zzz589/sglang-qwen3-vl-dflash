@@ -16,9 +16,11 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import inspect
 import logging
 import time
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Union
 
@@ -1754,6 +1756,13 @@ class ModelRunner:
         kwargs = self._pp_kwargs(pp_proxy_tensors)
         if forward_batch.input_embeds is not None:
             kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16()
+            dump_dir = os.environ.get("DSPARK_PARITY_DUMP_DIR")
+            if dump_dir and not torch.cuda.is_current_stream_capturing():
+                Path(dump_dir).mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    {"input": kwargs["input_embeds"].detach().cpu(), "input_ids": forward_batch.input_ids.detach().cpu(), "positions": forward_batch.positions.detach().cpu()},
+                    Path(dump_dir) / f"runtime_runner_embed_{time.time_ns()}.pt",
+                )
         if (
             forward_batch.replace_embeds is not None
             and forward_batch.replace_positions is not None

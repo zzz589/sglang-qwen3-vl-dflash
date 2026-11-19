@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import os
+import time
+from pathlib import Path
+
 import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Iterable, Optional, Tuple
@@ -650,18 +654,27 @@ class DSparkDraftMixin:
         pool,
         positions: torch.Tensor,
         cache_loc: torch.Tensor,
+        rope_positions: Optional[torch.Tensor] = None,
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
         target_hidden_is_projected: bool = False,
     ) -> None:
+        if rope_positions is None:
+            rope_positions = positions
+        if rope_positions.ndim not in (1, 2) or rope_positions.shape[-1] != positions.numel():
+            raise ValueError("rope_positions must be [N] or [3, N]")
         ctx_hidden = (
             target_hidden
             if target_hidden_is_projected
             else self.project_target_hidden(target_hidden)
         )
+        dump_dir = os.environ.get("DSPARK_PARITY_DUMP_DIR")
+        if dump_dir and not torch.cuda.is_current_stream_capturing():
+            Path(dump_dir).mkdir(parents=True, exist_ok=True)
+            torch.save(ctx_hidden.detach().cpu(), Path(dump_dir) / "runtime_ctx_hidden.pt")
 
         bundle = self._fused_kv_write_bundle(pool)
-        if bundle is not None:
+        if bundle is not None and rope_positions.ndim == 1:
             from sglang.kernels.ops.speculative.dspark.fused_kv_write import (
                 fused_kv_norm_rope_write,
             )
@@ -696,8 +709,12 @@ class DSparkDraftMixin:
         stacked = self._stacked_ctx_kv_params()
         if stacked is not None:
             k_all, v_all = self._project_ctx_kv_stacked(
-                ctx_hidden=ctx_hidden, positions=positions, stacked=stacked
+                ctx_hidden=ctx_hidden, positions=rope_positions, stacked=stacked
             )
+            if os.environ.get("DSPARK_PARITY_DUMP_DIR") and not torch.cuda.is_current_stream_capturing():
+                dump_dir = Path(os.environ["DSPARK_PARITY_DUMP_DIR"])
+                dump_dir.mkdir(parents=True, exist_ok=True)
+                torch.save({"k": k_all[0].detach().cpu(), "v": v_all[0].detach().cpu(), "positions": positions.detach().cpu(), "rope_positions": rope_positions.detach().cpu()}, dump_dir / f"runtime_ctx_kv_{time.time_ns()}.pt")
         for i, layer in enumerate(self.layers):
             attn = layer.self_attn
             if stacked is not None:
@@ -706,7 +723,11 @@ class DSparkDraftMixin:
             else:
                 k, v = attn.kv_proj_only(ctx_hidden)
                 k = attn.apply_k_norm(k)
-                k = attn.apply_k_rope(positions, k)
+                if os.environ.get("DSPARK_PARITY_DUMP_DIR") and not torch.cuda.is_current_stream_capturing():
+                    dump_dir = Path(os.environ["DSPARK_PARITY_DUMP_DIR"])
+                    dump_dir.mkdir(parents=True, exist_ok=True)
+                    torch.save({"k": k.detach().cpu(), "v": v.detach().cpu(), "positions": positions.detach().cpu(), "rope_positions": rope_positions.detach().cpu()}, dump_dir / f"runtime_ctx_kv_{time.time_ns()}.pt")
+                k = attn.apply_k_rope(rope_positions, k)
                 k = k.view(-1, attn.num_kv_heads, attn.head_dim)
                 v = v.view(-1, attn.num_kv_heads, attn.head_dim)
             if cache_loc_2d is not None and commit_lens is not None:

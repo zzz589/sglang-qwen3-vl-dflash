@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
+import time
+from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import msgspec
@@ -36,6 +39,24 @@ if TYPE_CHECKING:
     from sglang.srt.models.dspark import BaseDSparkMarkovHead
 
 logger = logging.getLogger(__name__)
+
+
+def _parity_dump(name: str, payload: dict) -> None:
+    directory = os.environ.get("DSPARK_PARITY_DUMP_DIR")
+    if not directory:
+        return
+    path = Path(directory)
+    path.mkdir(parents=True, exist_ok=True)
+    index_path = path / ".counter"
+    try:
+        index = int(index_path.read_text())
+    except FileNotFoundError:
+        index = 0
+    index_path.write_text(str(index + 1))
+    torch.save(
+        {key: (value.detach().cpu() if torch.is_tensor(value) else value) for key, value in payload.items()},
+        path / f"{index:04d}_{name}.pt",
+    )
 
 
 # Draft step logits: NaN is a bug, but -inf is legitimate (masking).
@@ -432,6 +453,16 @@ class DraftBlockProposer:
                 tp_sync=self._tp_sync,
                 greedy_draft=self._greedy_draft,
             )
+            _parity_dump(
+                "proposal",
+                {
+                    "base_logits": base_logits,
+                    "corrected_logits": draft_block.corrected_logits,
+                    "draft_tokens": draft_block.draft_tokens,
+                    "anchor_tokens": draft_block_ids[:, 0],
+                    "draft_hidden": fwd.draft_hidden_3d,
+                },
+            )
             if self.draft_model.confidence_head is not None:
                 confidence, confidence_raw = self.draft_model.compute_confidence(
                     anchor_tokens=draft_block_ids[:, 0],
@@ -517,6 +548,10 @@ class DraftBlockProposer:
         if not draft_owns_embed:
             noise_embedding = embed_module(draft_block_ids)
             draft_input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
+            dump_dir = os.environ.get("DSPARK_PARITY_DUMP_DIR")
+            if dump_dir and not torch.cuda.is_current_stream_capturing():
+                Path(dump_dir).mkdir(parents=True, exist_ok=True)
+                torch.save({"input": draft_input_embeds.detach().cpu(), "input_ids": draft_block_ids.detach().cpu(), "positions": draft_positions.detach().cpu()}, Path(dump_dir) / f"runtime_noise_embed_{time.time_ns()}.pt")
 
         if batch.seq_lens_cpu is not None:
             draft_seq_lens_cpu = batch.seq_lens_cpu + query_token_num
@@ -547,6 +582,17 @@ class DraftBlockProposer:
             ),
             global_num_token_non_padded_cpu=draft_num_tokens,
         )
+        dump_dir = os.environ.get("DSPARK_PARITY_DUMP_DIR")
+        if dump_dir and not torch.cuda.is_current_stream_capturing():
+            Path(dump_dir).mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {"input": draft_forward_batch.input_embeds.detach().cpu(), "input_ids": draft_forward_batch.input_ids.detach().cpu(), "positions": draft_forward_batch.positions.detach().cpu()},
+                Path(dump_dir) / f"runtime_fb_embed_{time.time_ns()}.pt",
+            )
+        if self.draft_model_runner.model_config.model_is_mrope:
+            draft_forward_batch.compute_spec_mrope_positions(
+                self.draft_model_runner, batch, seq_positions=draft_positions
+            )
         verify_window.kv_loc_plan.bind(
             draft_forward_batch,
             self.draft_model_runner.kv_index_translator,
@@ -566,6 +612,15 @@ class DraftBlockProposer:
         raw_hidden = logits_output.hidden_states
         if raw_hidden is None:
             raise RuntimeError("DSpark draft model returned no hidden states.")
+        _parity_dump(
+            "draft_forward",
+            {
+                "raw_hidden": raw_hidden,
+                "draft_block_ids": draft_block_ids,
+                "draft_positions": draft_positions,
+                "draft_input_embeds": draft_input_embeds,
+            },
+        )
         if self.sample_from_anchor:
             expected_rows = bs * gamma
             if raw_hidden.shape[0] != expected_rows:

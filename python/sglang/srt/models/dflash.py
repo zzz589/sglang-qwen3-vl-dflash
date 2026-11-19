@@ -5,6 +5,15 @@
 from __future__ import annotations
 
 import logging
+import os
+import time
+from pathlib import Path
+import os
+from pathlib import Path
+import os
+from pathlib import Path
+import os
+from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -349,6 +358,10 @@ class DFlashAttention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
+        dump_dir = os.environ.get("DSPARK_PARITY_DUMP_DIR")
+        if dump_dir and self.attn.layer_id == 0 and not torch.cuda.is_current_stream_capturing():
+            Path(dump_dir).mkdir(parents=True, exist_ok=True)
+            torch.save({"input": hidden_states.detach().cpu(), "qkv": qkv.detach().cpu(), "positions": positions.detach().cpu(), "input_ids": forward_batch.input_ids.detach().cpu()}, Path(dump_dir) / f"runtime_attn0_raw_{time.time_ns()}.pt")
         if _is_npu:
             q, k, v = self.forward_prepare_npu(positions, hidden_states)
         elif self.use_table_qk_norm_rope and qkv.dtype == torch.bfloat16:
@@ -372,12 +385,20 @@ class DFlashAttention(nn.Module):
             q, k = self.rotary_emb(positions, q, k)
         if self.v_scale is not None:
             v = v * self.v_scale
+        dump_dir = os.environ.get("DSPARK_PARITY_DUMP_DIR")
+        if dump_dir and self.attn.layer_id == 0 and not torch.cuda.is_current_stream_capturing():
+            Path(dump_dir).mkdir(parents=True, exist_ok=True)
+            torch.save({"q": q.detach().cpu(), "k": k.detach().cpu(), "v": v.detach().cpu(), "positions": positions.detach().cpu()}, Path(dump_dir) / f"runtime_attn0_qkv_{time.time_ns()}.pt")
         if self.attention_sink_bias is None:
             attn_output = self.attn(q, k, v, forward_batch)
         else:
             attn_output = self.attn(
                 q, k, v, forward_batch, sinks=self.attention_sink_bias
             )
+        dump_dir = os.environ.get("DSPARK_PARITY_DUMP_DIR")
+        if dump_dir and self.attn.layer_id == 0 and not torch.cuda.is_current_stream_capturing():
+            Path(dump_dir).mkdir(parents=True, exist_ok=True)
+            torch.save({"attn_output": attn_output.detach().cpu(), "positions": positions.detach().cpu()}, Path(dump_dir) / f"runtime_attn0_output_{time.time_ns()}.pt")
         attn_output = self.apply_attention_output(attn_output, hidden_states)
         output, _ = self.o_proj(attn_output)
         return output
@@ -587,6 +608,17 @@ class DFlashDecoderLayer(nn.Module):
             return hidden_states, residual
 
         # Pre-norm attention with fused residual+norm when possible (Qwen3-style).
+        if (
+            os.environ.get("DSPARK_PARITY_DUMP_DIR")
+            and self.self_attn.attn.layer_id == 0
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            dump_dir = Path(os.environ["DSPARK_PARITY_DUMP_DIR"])
+            dump_dir.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {"input": hidden_states.detach().cpu(), "positions": positions.detach().cpu()},
+                dump_dir / f"runtime_layer0_input_{time.time_ns()}.pt",
+            )
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -805,13 +837,24 @@ class DFlashDraftModel(nn.Module):
                     "DFlashDraftModel requires `input_embeds` (use the target "
                     "embedding)."
                 )
+        if os.environ.get("DSPARK_PARITY_DUMP_DIR") and not torch.cuda.is_current_stream_capturing():
+            dump_dir = Path(os.environ["DSPARK_PARITY_DUMP_DIR"])
+            dump_dir.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {"input": input_embeds.detach().cpu(), "input_ids": input_ids.detach().cpu(), "positions": positions.detach().cpu()},
+                dump_dir / f"runtime_model_input_{time.time_ns()}.pt",
+            )
         hidden_states = input_embeds
         residual: Optional[torch.Tensor] = None
 
-        for layer in self.layers:
+        for layer_idx, layer in enumerate(self.layers):
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual
             )
+            dump_dir = os.environ.get("DSPARK_PARITY_DUMP_DIR")
+            if dump_dir and not torch.cuda.is_current_stream_capturing():
+                Path(dump_dir).mkdir(parents=True, exist_ok=True)
+                torch.save((hidden_states if residual is None else hidden_states + residual).detach().cpu(), Path(dump_dir) / f"runtime_layer_{layer_idx}.pt")
 
         if hidden_states.numel() != 0:
             if residual is None:
