@@ -54,8 +54,9 @@ except ImportError:
 
 def _radix_topk(scores: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
     # The selector's largest single cost: it reads the whole logits tensor.
-    if _flashinfer_top_k is not None:
-        return _flashinfer_top_k(scores, k, sorted=True, deterministic=True)
+    # FlashInfer 0.6.17's bundled CUDA headers are incompatible with this
+    # cluster's CUDA compiler.  torch.topk is an exact correctness fallback;
+    # only selector throughput differs.
     return torch.topk(scores, k, dim=-1)
 
 
