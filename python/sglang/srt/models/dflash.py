@@ -176,6 +176,7 @@ class DFlashAttention(nn.Module):
         rotary = self.rotary_emb
         self.use_table_qk_norm_rope = (
             not _is_npu
+            and not (isinstance(rope_scaling, dict) and "mrope_section" in rope_scaling)
             and hasattr(rotary, "cos_sin_cache")
             and getattr(rotary, "rotary_dim", None) == head_dim
             and getattr(rotary, "is_neox_style", False)
@@ -582,6 +583,11 @@ class DFlashDraftModel(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
+        _, rope_scaling = get_rope_config(self.config)
+        if isinstance(rope_scaling, dict) and rope_scaling.get("mrope_section"):
+            positions = forward_batch.mrope_positions
+            if positions is None or positions.ndim != 2 or positions.shape[0] != 3:
+                raise ValueError("DFlash2 mRoPE requires ForwardBatch.mrope_positions [3, N]")
         if input_embeds is None:
             if hasattr(self, "forward_embed"):
                 input_embeds = self.forward_embed(input_ids)

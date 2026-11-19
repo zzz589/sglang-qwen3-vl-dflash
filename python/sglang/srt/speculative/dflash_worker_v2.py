@@ -55,6 +55,7 @@ from sglang.srt.speculative.draft_worker_common import (
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     SIMULATE_ACC_METHOD,
@@ -299,6 +300,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self._draft_sampler = None
         self.draft_model = bundle.draft_model
+        _, rope_scaling = get_rope_config(self.draft_model.config)
+        self._draft_uses_mrope = isinstance(rope_scaling, dict) and bool(
+            rope_scaling.get("mrope_section")
+        )
+        logger.info(
+            "DFLASH draft position encoding: %s",
+            "Qwen3-VL interleaved mRoPE" if self._draft_uses_mrope else "1D RoPE",
+        )
         self.selector = self.draft_model.candidate_selector
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
@@ -380,7 +389,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_greedy_rank_index_buf: Optional[torch.Tensor] = None
         self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_index_cap: int = 0
-        self._use_fused_kv_materialize = is_cuda() or is_hip()
+        self._use_fused_kv_materialize = (is_cuda() or is_hip()) and not self._draft_uses_mrope
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
@@ -1266,6 +1275,36 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         return out_tokens
 
+    def _prompt_mrope_positions(self, batch, prefix_lens, extend_lens, device):
+        """Return target Qwen3-VL positions in captured-token order."""
+        chunks = []
+        mm_inputs = batch.multimodal_inputs
+        for index, (start, length) in enumerate(zip(prefix_lens, extend_lens)):
+            mm = mm_inputs[index] if mm_inputs is not None else None
+            if mm is None:
+                chunk = torch.arange(start, start + length, device=device)
+                chunk = chunk.unsqueeze(0).expand(3, -1)
+            else:
+                all_positions = mm.mrope_positions
+                if all_positions is None or all_positions.shape[1] < start + length:
+                    raise ValueError("Qwen3-VL prompt mRoPE positions are missing")
+                chunk = all_positions[:, start : start + length].to(device)
+            chunks.append(chunk)
+        return torch.cat(chunks, dim=1).to(torch.int64)
+
+    def _block_mrope_positions(self, batch, positions_2d):
+        """Generated text uses target's per-request mRoPE position delta."""
+        mm_inputs = batch.multimodal_inputs
+        chunks = []
+        for index in range(positions_2d.shape[0]):
+            mm = mm_inputs[index] if mm_inputs is not None else None
+            delta = 0 if mm is None else mm.mrope_position_delta
+            if delta is None:
+                raise ValueError("Qwen3-VL mRoPE position delta is missing")
+            chunk = positions_2d[index].to(torch.int64) + int(delta)
+            chunks.append(chunk.unsqueeze(0).expand(3, -1))
+        return torch.cat(chunks, dim=1)
+
     def _append_target_hidden_to_draft_kv_by_loc(
         self,
         *,
@@ -1295,9 +1334,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             raise ValueError(
                 f"DFLASH cache_loc must be 1D, got shape={tuple(cache_loc.shape)}."
             )
-        if positions.ndim != 1:
+        expected_ndim = 2 if self._draft_uses_mrope else 1
+        if positions.ndim != expected_ndim or (
+            self._draft_uses_mrope and positions.shape[0] != 3
+        ):
             raise ValueError(
-                f"DFLASH positions must be 1D, got shape={tuple(positions.shape)}."
+                f"DFLASH positions must be [3, N] for mRoPE or [N] for text, got shape={tuple(positions.shape)}."
             )
         num_tokens = int(target_hidden.shape[0])
         if int(cache_loc.numel()) != num_tokens:
@@ -1305,10 +1347,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                 "DFLASH cache_loc length mismatch: "
                 f"cache_loc={int(cache_loc.numel())}, target_hidden={num_tokens}."
             )
-        if int(positions.numel()) != num_tokens:
+        if int(positions.shape[-1]) != num_tokens:
             raise ValueError(
                 "DFLASH positions length mismatch: "
-                f"positions={int(positions.numel())}, target_hidden={num_tokens}."
+                f"positions={int(positions.shape[-1])}, target_hidden={num_tokens}."
             )
         if cache_loc_2d is not None:
             if cache_loc_2d.ndim != 2:
@@ -1685,6 +1727,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_lens,
                 int(sum(batch.extend_lens)),
             )
+            if self._draft_uses_mrope:
+                positions = self._prompt_mrope_positions(
+                    batch, batch.prefix_lens, batch.extend_lens, device
+                )
             self._append_target_hidden_to_draft_kv_by_loc(
                 target_hidden=logits_output.hidden_states,
                 cache_loc=batch.out_cache_loc,
@@ -1826,6 +1872,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
         positions = positions_2d.reshape(-1)
+        draft_mrope_positions = (
+            self._block_mrope_positions(batch, positions_2d)
+            if self._draft_uses_mrope
+            else None
+        )
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
 
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
@@ -1881,6 +1932,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
+        if draft_mrope_positions is not None:
+            forward_batch.mrope_positions = draft_mrope_positions
 
         if self.selector is not None:
             self._selector_sample = None
@@ -2128,7 +2181,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
             cache_loc=verify_out_cache_loc,
             cache_loc_2d=verify_out_cache_loc_2d,
-            positions=positions,
+            positions=(draft_mrope_positions if draft_mrope_positions is not None else positions),
             commit_lens=commit_lens,
         )
 
